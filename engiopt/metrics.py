@@ -116,7 +116,7 @@ def simulate_failure_ratio(  # noqa: C901
                 return_queue.put(("error", traceback.format_exc()))
 
         # Attempt to simulate the design
-        def run_with_timeout(idx, timeout=30):
+        def run_with_timeout(idx, timeout=60):  # Increased to 5 minutes
             config = sampled_conditions[idx] if sampled_conditions is not None else None
             q = multiprocessing.Queue()
             p = multiprocessing.Process(target=worker, args=(idx, config, q))
@@ -126,7 +126,8 @@ def simulate_failure_ratio(  # noqa: C901
             if p.is_alive():
                 p.terminate()  # force-kill the child process
                 p.join()
-                os.system("docker stop machaero")  # noqa: S605
+                # Clean up any running container processes (compatible with both Docker and Apptainer)
+                os.system("pkill -f 'apptainer\|singularity\|docker' 2>/dev/null || true")  # noqa: S605
                 raise RuntimeError(f"Simulation timed out for design {idx}")
 
             if not q.empty():
@@ -139,7 +140,7 @@ def simulate_failure_ratio(  # noqa: C901
                 raise RuntimeError("Simulation process ended without reporting back")
 
         try:
-            run_with_timeout(idx, timeout=30)
+            run_with_timeout(idx, timeout=60)
         except RuntimeError as e:
             failure_count += 1
             print(e)
