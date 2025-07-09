@@ -116,7 +116,7 @@ def simulate_failure_ratio(  # noqa: C901
                 return_queue.put(("error", traceback.format_exc()))
 
         # Attempt to simulate the design
-        def run_with_timeout(idx, timeout=60):  # Increased to 5 minutes
+        def run_with_timeout(idx, timeout=90):  # Increased to 5 minutes
             config = sampled_conditions[idx] if sampled_conditions is not None else None
             q = multiprocessing.Queue()
             p = multiprocessing.Process(target=worker, args=(idx, config, q))
@@ -140,7 +140,7 @@ def simulate_failure_ratio(  # noqa: C901
                 raise RuntimeError("Simulation process ended without reporting back")
 
         try:
-            run_with_timeout(idx, timeout=60)
+            run_with_timeout(idx, timeout=90)
         except RuntimeError as e:
             failure_count += 1
             print(e)

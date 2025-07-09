@@ -20,7 +20,6 @@ import torch as th
 from torch import nn
 from torchvision import transforms
 import tqdm
-import tyro
 
 from engiopt.transforms import flatten_dict_factory
 import wandb
@@ -30,7 +29,7 @@ if TYPE_CHECKING:
 
 
 class Normalizer:
-    """Normalizes or denormalizes the input tensor."""
+    """Base normalizer class."""
 
     def __init__(self, min_val: th.Tensor, max_val: th.Tensor, eps: float = 1e-7):
         self.eps = eps
@@ -39,11 +38,274 @@ class Normalizer:
 
     def normalize(self, x: th.Tensor) -> th.Tensor:
         """Normalizes the input tensor."""
-        return (x - self.min_val) / (self.max_val - self.min_val + self.eps)
+        raise NotImplementedError
 
     def denormalize(self, x: th.Tensor) -> th.Tensor:
         """Denormalizes the input tensor."""
-        return x * (self.max_val - self.min_val + self.eps) + self.min_val
+        raise NotImplementedError
+
+
+class MinMaxNormalizer(Normalizer):
+    """Min-Max normalization to [0, 1]."""
+
+    def normalize(self, x: th.Tensor) -> th.Tensor:
+        """Normalizes the input tensor to [0, 1]."""
+        device = x.device
+        min_val = self.min_val.to(device)
+        max_val = self.max_val.to(device)
+        return (x - min_val) / (max_val - min_val + self.eps)
+
+    def denormalize(self, x: th.Tensor) -> th.Tensor:
+        """Denormalizes the input tensor from [0, 1]."""
+        device = x.device
+        min_val = self.min_val.to(device)
+        max_val = self.max_val.to(device)
+        return x * (max_val - min_val + self.eps) + min_val
+
+
+class StandardScalerNormalizer(Normalizer):
+    """Standard scaler normalization (z-score)."""
+
+    def __init__(self, mean_val: th.Tensor, std_val: th.Tensor, eps: float = 1e-7):
+        super().__init__(mean_val, std_val, eps)  # Use mean/std as min/max for consistency
+        self.mean_val = mean_val
+        self.std_val = std_val
+
+    def normalize(self, x: th.Tensor) -> th.Tensor:
+        """Normalizes the input tensor using z-score."""
+        device = x.device
+        mean_val = self.mean_val.to(device)
+        std_val = self.std_val.to(device)
+        return (x - mean_val) / (std_val + self.eps)
+
+    def denormalize(self, x: th.Tensor) -> th.Tensor:
+        """Denormalizes the input tensor from z-score."""
+        device = x.device
+        mean_val = self.mean_val.to(device)
+        std_val = self.std_val.to(device)
+        return x * (std_val + self.eps) + mean_val
+
+
+class NoNormalizer(Normalizer):
+    """No normalization (identity)."""
+
+    def __init__(self):
+        # Dummy values for compatibility
+        super().__init__(th.tensor(0.0), th.tensor(1.0))
+
+    def normalize(self, x: th.Tensor) -> th.Tensor:
+        """Returns input unchanged."""
+        return x
+
+    def denormalize(self, x: th.Tensor) -> th.Tensor:
+        """Returns input unchanged."""
+        return x
+
+
+class MultiNormalizer:
+    """Normalizer that can handle multiple features separately."""
+    
+    def __init__(self, normalizers: list[Normalizer]):
+        self.normalizers = normalizers
+    
+    def normalize(self, x: th.Tensor) -> th.Tensor:
+        """Normalize each feature with its own normalizer."""
+        if len(self.normalizers) == 1:
+            # Common normalizer for all features
+            return self.normalizers[0].normalize(x)
+        else:
+            # Separate normalizer per feature
+            normalized_features = []
+            for i, normalizer in enumerate(self.normalizers):
+                if i < x.shape[-1]:  # Avoid index out of bounds
+                    normalized_features.append(normalizer.normalize(x[..., i:i+1]))
+            return th.cat(normalized_features, dim=-1)
+    
+    def denormalize(self, x: th.Tensor) -> th.Tensor:
+        """Denormalize each feature with its own normalizer."""
+        if len(self.normalizers) == 1:
+            # Common normalizer for all features
+            return self.normalizers[0].denormalize(x)
+        else:
+            # Separate normalizer per feature
+            denormalized_features = []
+            for i, normalizer in enumerate(self.normalizers):
+                if i < x.shape[-1]:  # Avoid index out of bounds
+                    denormalized_features.append(normalizer.denormalize(x[..., i:i+1]))
+            return th.cat(denormalized_features, dim=-1)
+
+
+def create_normalizer(normalization_type: str, data_tensor: th.Tensor, device: th.device, strategy: str = "common") -> Normalizer:
+    """Factory function to create the appropriate normalizer."""
+    if normalization_type == "MinMax":
+        if strategy == "common":
+            # Common mode: calculate across all but first dimension (original behavior)
+            min_val = data_tensor.amin(dim=tuple(range(1, data_tensor.ndim))).to(device)
+            max_val = data_tensor.amax(dim=tuple(range(1, data_tensor.ndim))).to(device)
+        else:
+            # Separate mode: calculate across samples (dim 0) for each feature
+            min_val = data_tensor.amin(dim=0).to(device)
+            max_val = data_tensor.amax(dim=0).to(device)
+        return MinMaxNormalizer(min_val, max_val)
+    
+    elif normalization_type == "StandardScaler":
+        if strategy == "common":
+            # Common mode: calculate across all but first dimension (original behavior)
+            mean_val = data_tensor.mean(dim=tuple(range(1, data_tensor.ndim))).to(device)
+            std_val = data_tensor.std(dim=tuple(range(1, data_tensor.ndim))).to(device)
+        else:
+            # Separate mode: calculate across samples (dim 0) for each feature
+            mean_val = data_tensor.mean(dim=0).to(device)
+            std_val = data_tensor.std(dim=0).to(device)
+        return StandardScalerNormalizer(mean_val, std_val)
+    
+    elif normalization_type == "No Norm":
+        return NoNormalizer()
+    
+    else:
+        raise ValueError(f"Unknown normalization type: {normalization_type}")
+
+def create_multi_normalizer(
+    normalization_type: str, 
+    data_tensor: th.Tensor, 
+    device: th.device,
+    strategy: str = "common"
+) -> MultiNormalizer:
+    """Factory function to create multi-normalizer with different strategies.
+    
+    Args:
+        normalization_type: Type of normalization ('MinMax', 'StandardScaler', 'No Norm')
+        data_tensor: Input data tensor with shape [..., n_features]
+        device: Device to put normalizers on
+        strategy: 'common' (single scaler) or 'separate' (per-feature scaler)
+    
+    Returns:
+        MultiNormalizer instance
+    """
+    if strategy == "common":
+        # Single normalizer for all features
+        normalizer = create_normalizer(normalization_type, data_tensor, device, strategy)
+        return MultiNormalizer([normalizer])
+    
+    elif strategy == "separate":
+        # Separate normalizer for each feature
+        normalizers = []
+        n_features = data_tensor.shape[-1]
+        
+        for i in range(n_features):
+            # Extract data for feature i
+            feature_data = data_tensor[..., i:i+1]
+            normalizer = create_normalizer(normalization_type, feature_data, device, strategy)
+            normalizers.append(normalizer)
+        
+        return MultiNormalizer(normalizers)
+    
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}. Available: ['common', 'separate']")
+
+
+class CPWGenerator(nn.Module):
+    """Control Points and Weights Generator.
+    
+    Generates control points and weights for parametric curves,
+    then interpolates to create the exact number of output features needed.
+    """
+    
+    def __init__(self, input_dim: int, n_output_features: int, n_points: int = 10):
+        super().__init__()
+        self.n_points = n_points
+        self.n_output_features = n_output_features
+        
+        # Generate control points (we use 2D points for variety)
+        self.control_points_net = nn.Sequential(
+            nn.Linear(input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, n_points * 2),  # n_points with x,y coordinates
+            nn.Tanh()  # Control points in [-1, 1]
+        )
+        
+        # Generate weights
+        self.weights_net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, n_points),
+            nn.Softmax(dim=-1)  # Weights sum to 1
+        )
+    
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        """Forward pass.
+        
+        Args:
+            x: Input tensor [batch_size, input_dim]
+            
+        Returns:
+            output_features: [batch_size, n_output_features]
+        """
+        # Generate control points
+        cp_flat = self.control_points_net(x)
+        control_points = cp_flat.view(-1, self.n_points, 2)  # [batch, n_points, 2]
+        
+        # Generate weights
+        weights = self.weights_net(x)  # [batch, n_points]
+        
+        # Interpolate to generate exact number of output features
+        output_features = interpolate_from_control_points(
+            control_points, weights, self.n_output_features
+        )
+        
+        return output_features
+
+
+def interpolate_from_control_points(control_points: th.Tensor, weights: th.Tensor, n_output_features: int) -> th.Tensor:
+    """Interpolate features from control points and weights.
+    
+    Args:
+        control_points: [batch_size, n_points, n_dims]
+        weights: [batch_size, n_points]
+        n_output_features: Number of features to generate
+        
+    Returns:
+        interpolated_features: [batch_size, n_output_features]
+    """
+    batch_size = control_points.shape[0]
+    n_points = control_points.shape[1]
+    n_dims = control_points.shape[2]
+    
+    # Create parameter values t in [0, 1] for each output feature
+    t_values = th.linspace(0, 1, n_output_features, device=control_points.device)
+    
+    # Simple weighted interpolation to generate features
+    interpolated = []
+    
+    for i, t_val in enumerate(t_values):
+        # Calculate basis functions (simple distance-based weighting)
+        basis = th.zeros_like(weights)
+        for j in range(n_points):
+            # Simple distance-based weighting
+            center = j / (n_points - 1) if n_points > 1 else 0.5
+            sigma = 1.0 / n_points
+            basis[:, j] = th.exp(-((t_val - center) ** 2) / (2 * sigma ** 2))
+        
+        # Normalize basis functions
+        basis = basis / (basis.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # Weight the basis functions
+        weighted_basis = basis * weights
+        weighted_basis = weighted_basis / (weighted_basis.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # Interpolate feature value (use average of all dims from control points)
+        feature_value = th.sum(weighted_basis.unsqueeze(-1) * control_points, dim=1)
+        # Take mean across dimensions to get a single feature value
+        feature_value = feature_value.mean(dim=-1, keepdim=True)
+        interpolated.append(feature_value)
+    
+    # Concatenate all features
+    interpolated = th.cat(interpolated, dim=-1)  # [batch_size, n_output_features]
+    return interpolated
 
 
 @dataclass
@@ -84,23 +346,74 @@ class Args:
     """number of cpu threads to use during batch generation"""
     latent_dim: int = 4
     """dimensionality of the latent space"""
+    noise_dim: int = 10
+    """dimensionality of the noise space for design diversity"""
     sample_interval: int = 400
     """interval between image samples"""
+    
+    # === ABLATION STUDY BOOLEANS ===
+    # Step 1: Noise z for design diversity
+    use_noise_z: bool = True
+    """If True, use noise z + latent c (v1.1), else use only latent z (baseline)"""
+    
+    # Step 2: Normalization improvements
+    normalization_type: str = "MinMax"
+    """Type of normalization: 'StandardScaler', 'MinMax', or 'No Norm'"""
+    
+    normalization_strategy: str = "common"
+    """Normalization strategy: 'common' (single scaler) or 'separate' (per-feature scaler)"""
+    
+    # Step 3: CPW Generator for control points
+    use_cpw_generator: bool = False
+    """If True, add CPWGenerator for control points and weights"""
+    
+    # Step 4: Scalar decoder
+    use_scalar_decoder: bool = False
+    """If True, add scalar decoder/generator for design scalars"""
+    
+    # Step 5: Separate normalization
+    use_separate_normalization: bool = False
+    """If True, use separate normalizers for conditions vs scalars"""
+    
+    # Step 6: MLP features
+    use_mlp_features: bool = False
+    """If True, add MLP feature generator for abstract features"""
+    
+    # Step 7: Coordinate decoder (alternative to Bezier)
+    use_coord_decoder: bool = False
+    """If True, use coordinate decoder instead of simple MLP"""
+    
+    # Step 8: Advanced discriminator
+    use_advanced_discriminator: bool = False
+    """If True, use CNN+InfoGAN discriminator instead of simple MLP"""
+    
+    # Step 9: Bezier layer
+    use_bezier_layer: bool = False
+    """If True, add BezierLayer for geometric constraints"""
+    
+    # Step 10: Advanced loss functions
+    use_advanced_losses: bool = False
+    """If True, add Q-Loss, R-Loss, Curvature-Loss"""
 
 
 class Generator(nn.Module):
     def __init__(
         self,
         latent_dim: int,
+        noise_dim: int,
         n_conds: int,
         design_shape: tuple[int, ...],
-        design_normalizer: Normalizer,
-        conds_normalizer: Normalizer,
+        design_normalizer: MultiNormalizer,
+        conds_normalizer: MultiNormalizer,
+        use_noise_z: bool = True,
+        use_cpw_generator: bool = False,
     ):
         super().__init__()
         self.design_shape = design_shape  # Store design shape
         self.design_normalizer = design_normalizer
         self.conds_normalizer = conds_normalizer
+        self.use_noise_z = use_noise_z
+        self.use_cpw_generator = use_cpw_generator
 
         def block(in_feat: int, out_feat: int, *, normalize: bool = True) -> list[nn.Module]:
             layers: list[nn.Module] = [nn.Linear(in_feat, out_feat)]
@@ -109,33 +422,65 @@ class Generator(nn.Module):
             layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
 
-        self.model = nn.Sequential(
-            *block(latent_dim + n_conds, 128, normalize=False),
-            *block(128, 256),
-            *block(256, 512),
-            *block(512, 1024),
-            nn.Linear(1024, int(np.prod(design_shape))),
-            nn.Tanh(),
-        )
+        # Calculate input dimension based on whether we use noise_z
+        input_dim = latent_dim + n_conds
+        if self.use_noise_z:
+            input_dim += noise_dim
 
-    def forward(self, z: th.Tensor, conds: th.Tensor) -> th.Tensor:
+        if self.use_cpw_generator:
+            # Step 3: Use CPWGenerator for control points and weights
+            n_output_features = int(np.prod(design_shape))  # Exact number needed (e.g., 385)
+            self.cpw_generator = CPWGenerator(
+                input_dim=input_dim, 
+                n_output_features=n_output_features,
+                n_points=10
+            )
+        else:
+            # Standard MLP generator
+            self.model = nn.Sequential(
+                *block(input_dim, 128, normalize=False),
+                *block(128, 256),
+                *block(256, 512),
+                *block(512, 1024),
+                nn.Linear(1024, int(np.prod(design_shape))),
+                nn.Tanh(),
+            )
+
+    def forward(self, c: th.Tensor, z: th.Tensor = None, conds: th.Tensor = None) -> th.Tensor:
         """Forward pass for the generator.
 
         Args:
-            z (th.Tensor): Latent space input tensor.
+            c (th.Tensor): Latent code input tensor.
+            z (th.Tensor, optional): Noise input tensor. Used only if use_noise_z=True.
             conds (th.Tensor): Condition tensor.
 
         Returns:
             th.Tensor: Generated design tensor.
         """
         normalized_conds = self.conds_normalizer.normalize(conds)
-        gen_input = th.cat((z, normalized_conds), -1)
-        design = self.model(gen_input)
-        return self.design_normalizer.denormalize(design.view(design.size(0), *self.design_shape))
+        
+        if self.use_noise_z and z is not None:
+            # Version 1.1+: use both c and z
+            gen_input = th.cat((c, z, normalized_conds), -1)
+        else:
+            # Baseline version: use only c
+            gen_input = th.cat((c, normalized_conds), -1)
+        
+        if self.use_cpw_generator:
+            # Step 3: Generate using control points and weights
+            design_flat = self.cpw_generator(gen_input)  # Returns [batch, n_features] directly
+            design = design_flat.view(design_flat.size(0), *self.design_shape)
+        else:
+            # Standard generation
+            design = self.model(gen_input)
+            design = design.view(design.size(0), *self.design_shape)
+            
+        return self.design_normalizer.denormalize(design)
 
 
 class Discriminator(nn.Module):
-    def __init__(self, conds_normalizer: Normalizer, design_normalizer: Normalizer):
+    def __init__(self, conds_normalizer: MultiNormalizer, design_normalizer: MultiNormalizer, 
+                 design_shape: tuple[int, ...], n_conds: int):
         super().__init__()
         self.conds_normalizer = conds_normalizer
         self.design_normalizer = design_normalizer
@@ -161,15 +506,22 @@ class Discriminator(nn.Module):
         return self.model(d_in)
 
 
-def prepare_data(problem: Problem, device: th.device) -> tuple[th.utils.data.TensorDataset, Normalizer, Normalizer]:
+def prepare_data(
+    problem: Problem, 
+    device: th.device, 
+    normalization_type: str = "MinMax",
+    normalization_strategy: str = "common"
+) -> tuple[th.utils.data.TensorDataset, MultiNormalizer, MultiNormalizer]:
     """Prepares the data for the generator and discriminator.
 
     Args:
         problem (Problem): The problem to prepare the data for.
         device (th.device): The device to prepare the data on.
+        normalization_type (str): Type of normalization ('MinMax', 'StandardScaler', 'No Norm').
+        normalization_strategy (str): Strategy ('common', 'separate').
 
     Returns:
-        tuple[th.utils.data.TensorDataset, Normalizer, Normalizer]: The training dataset, condition normalizer, and design normalizer.
+        tuple[th.utils.data.TensorDataset, MultiNormalizer, MultiNormalizer]: The training dataset, condition normalizer, and design normalizer.
     """
     training_ds = problem.dataset.with_format("torch", device=device)["train"]
 
@@ -184,22 +536,38 @@ def prepare_data(problem: Problem, device: th.device) -> tuple[th.utils.data.Ten
         *[training_ds[key] for key in problem.conditions_keys],
     )
 
-    # Create condition normalizer
-    cond_tensors = th.stack(training_ds.tensors[1:])
-    conds_min = cond_tensors.amin(dim=tuple(range(1, cond_tensors.ndim))).to(device)
-    conds_max = cond_tensors.amax(dim=tuple(range(1, cond_tensors.ndim))).to(device)
-    conds_normalizer = Normalizer(conds_min, conds_max)
+    # Create condition normalizer using the multi-normalizer factory
+    if normalization_strategy == "common":
+        # Mode common: garde le comportement original
+        cond_tensors = th.stack(training_ds.tensors[1:])
+    else:
+        # Mode separate: organise correctement les conditions par feature
+        # Les conditions sont dans training_ds.tensors[1:], chacune a shape [n_samples]
+        # On veut les organiser en [n_samples, n_conditions]
+        cond_list = [tensor.unsqueeze(1) for tensor in training_ds.tensors[1:]]
+        cond_tensors = th.cat(cond_list, dim=1)
+    
+    conds_normalizer = create_multi_normalizer(
+        normalization_type, cond_tensors, device, normalization_strategy
+    )
 
-    # Create design normalizer
-    design_tensors = training_ds.tensors[0].T
-    design_min = design_tensors.amin(dim=tuple(range(1, design_tensors.ndim))).to(device)
-    design_max = design_tensors.amax(dim=tuple(range(1, design_tensors.ndim))).to(device)
-    design_normalizer = Normalizer(design_min, design_max)
+    # Create design normalizer using the multi-normalizer factory
+    if normalization_strategy == "common":
+        # Mode common: garde le comportement original
+        design_tensors = training_ds.tensors[0].T
+    else:
+        # Mode separate: utilise les designs avec la forme [n_samples, n_features]
+        design_tensors = training_ds.tensors[0]
+    
+    design_normalizer = create_multi_normalizer(
+        normalization_type, design_tensors, device, normalization_strategy
+    )
 
     return training_ds, conds_normalizer, design_normalizer
 
 
 if __name__ == "__main__":
+    import tyro
     args = tyro.cli(Args)
 
     problem = BUILTIN_PROBLEMS[args.problem_id]()
@@ -235,7 +603,16 @@ if __name__ == "__main__":
     else:
         device = th.device("cpu")
 
-    training_ds, conds_normalizer, design_normalizer = prepare_data(problem, device)
+    training_ds, conds_normalizer, design_normalizer = prepare_data(
+        problem, device, args.normalization_type, args.normalization_strategy
+    )
+
+    print(f"Using normalization: {args.normalization_type} with strategy: {args.normalization_strategy}")
+    print(f"Conditions normalizers: {len(conds_normalizer.normalizers)}")
+    print(f"Design normalizers: {len(design_normalizer.normalizers)}")
+    print(f"Using CPWGenerator: {args.use_cpw_generator}")
+    print(f"Using noise z: {args.use_noise_z}")
+    print(f"Design shape: {design_shape} (total features: {int(np.prod(design_shape))})")
 
     dataloader = th.utils.data.DataLoader(
         training_ds,
@@ -249,12 +626,20 @@ if __name__ == "__main__":
     # Initialize generator and discriminator
     generator = Generator(
         latent_dim=args.latent_dim,
+        noise_dim=args.noise_dim,
         n_conds=n_conds,
         design_shape=design_shape,
         design_normalizer=design_normalizer,
         conds_normalizer=conds_normalizer,
+        use_noise_z=args.use_noise_z,
+        use_cpw_generator=args.use_cpw_generator,
     )
-    discriminator = Discriminator(conds_normalizer=conds_normalizer, design_normalizer=design_normalizer)
+    discriminator = Discriminator(
+        conds_normalizer=conds_normalizer, 
+        design_normalizer=design_normalizer,
+        design_shape=design_shape,
+        n_conds=n_conds
+    )
 
     generator.to(device)
     discriminator.to(device)
@@ -264,18 +649,27 @@ if __name__ == "__main__":
     optimizer_generator = th.optim.Adam(generator.parameters(), lr=args.lr_gen, betas=(args.b1, args.b2))
     optimizer_discriminator = th.optim.Adam(discriminator.parameters(), lr=args.lr_disc, betas=(args.b1, args.b2))
 
+    # Bounds for latent code c (aligned with cgan_bezier)
+    bounds = (0.0, 1.0)
+
     @th.no_grad()
     def sample_designs(n_designs: int) -> tuple[th.Tensor, th.Tensor]:
         """Samples n_designs from the generator."""
-        # Sample noise
-        z = th.randn((n_designs, args.latent_dim), device=device, dtype=th.float)
+        if args.use_noise_z:
+            # Version 1.1: Sample latent code c (uniform) and noise z (normal with std=0.5)
+            c = (bounds[1] - bounds[0]) * th.rand((n_designs, args.latent_dim), device=device, dtype=th.float) + bounds[0]
+            z = 0.5 * th.randn((n_designs, args.noise_dim), device=device, dtype=th.float)
+        else:
+            # Baseline version: Only latent code (called z for compatibility)
+            c = th.randn((n_designs, args.latent_dim), device=device, dtype=th.float)
+            z = None
 
         linspaces = [
             th.linspace(conds[:, i].min(), conds[:, i].max(), n_designs, device=device) for i in range(conds.shape[1])
         ]
 
         desired_conds = th.stack(linspaces, dim=1)
-        gen_designs = generator(z, desired_conds)
+        gen_designs = generator(c, z, desired_conds)
         return desired_conds, gen_designs
 
     # ----------
@@ -296,11 +690,15 @@ if __name__ == "__main__":
             # -----------------
             optimizer_generator.zero_grad()
 
-            # Sample noise as generator input
-            z = th.randn((designs.size(0), args.latent_dim), device=device, dtype=th.float)
-
-            # Generate a batch of images
-            gen_designs = generator(z, conds)
+            if args.use_noise_z:
+                # Version 1.1: Sample latent code and noise as generator input
+                c = (bounds[1] - bounds[0]) * th.rand((designs.size(0), args.latent_dim), device=device, dtype=th.float) + bounds[0]
+                z = 0.5 * th.randn((designs.size(0), args.noise_dim), device=device, dtype=th.float)
+                gen_designs = generator(c, z, conds)
+            else:
+                # Baseline version: Only latent code
+                c = th.randn((designs.size(0), args.latent_dim), device=device, dtype=th.float)
+                gen_designs = generator(c, None, conds)
 
             # Loss measures generator's ability to fool the discriminator
             g_loss = adversarial_loss(discriminator(gen_designs, conds), valid)
@@ -383,6 +781,13 @@ if __name__ == "__main__":
                         "generator": generator.state_dict(),
                         "optimizer_generator": optimizer_generator.state_dict(),
                         "loss": g_loss.item(),
+                        # Save configuration for evaluation compatibility
+                        "use_noise_z": args.use_noise_z,
+                        "use_cpw_generator": args.use_cpw_generator,
+                        "normalization_type": args.normalization_type,
+                        "normalization_strategy": args.normalization_strategy,
+                        "latent_dim": args.latent_dim,
+                        "noise_dim": args.noise_dim,
                     }
                     ckpt_disc = {
                         "epoch": epoch,
