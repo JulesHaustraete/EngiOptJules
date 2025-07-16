@@ -13,7 +13,7 @@ import pandas as pd
 import torch as th
 
 from engiopt import metrics
-from engiopt.cgan_1d.cgan_1d import Generator, MultiNormalizer, prepare_data
+from engiopt.cgan_1d.cgan_1d_etape10 import Generator, StandardScalerNormalizer, MinMaxNormalizer, prepare_data, prepare_data_with_separate_normalization
 from engiopt.dataset_sample_conditions import sample_conditions
 import wandb
 
@@ -35,9 +35,9 @@ class Args:
     sigma: float = 10.0
     """Kernel bandwidth for MMD and DPP metrics."""
     output_csv: str = "cgan_1d_{problem_id}_metrics.csv"
-    """Chemin du fichier CSV de sortie ; peut inclure {problem_id}."""
+    """Output CSV file path; can include {problem_id}."""
     version: str = "baseline"
-    """Label de version pour identifier l'expérience (informatif seulement)."""
+    """Version label to identify the experiment (informative only)."""
 
 
 def parse_args() -> Args:
@@ -103,9 +103,9 @@ if __name__ == "__main__":
 
     ### Set Up Generator ###
     if args.wandb_entity is not None:
-        artifact_path = f"{args.wandb_entity}/{args.wandb_project}/{args.problem_id}_cgan_1d_generator:latest"
+        artifact_path = f"{args.wandb_entity}/{args.wandb_project}/{args.problem_id}_cgan_1d_etape10_generator:latest" #Changer etape10 lorsque j'aurais réentrainé toutes les versions avec cgan_1d.py et non cgan1d_etape10.py
     else:
-        artifact_path = f"{args.wandb_project}/{args.problem_id}_cgan_1d_generator:latest"
+        artifact_path = f"{args.wandb_project}/{args.problem_id}_cgan_1d_etape10_generator:latest" #Changer etape10 lorsque j'aurais réentrainé toutes les versions avec cgan_1d.py et non cgan1d_etape10.py
 
     api = wandb.Api()
     artifact = api.artifact(artifact_path, type="model")
@@ -129,23 +129,50 @@ if __name__ == "__main__":
         run.config.get("normalization_strategy", "common")
     )
 
-    print(f"📋 Configuration du modèle W&B:")
-    print(f"   latent_dim: {run.config['latent_dim']}")
-    print(f"   noise_dim: {run.config.get('noise_dim', 10)}")
-    print(f"   use_noise_z: {run.config.get('use_noise_z', False)}")
-    print(f"   use_cpw_generator: {run.config.get('use_cpw_generator', False)}")
-    print(f"   normalization_type: {run.config.get('normalization_type', 'MinMax')}")
-    print(f"   normalization_strategy: {run.config.get('normalization_strategy', 'common')}")
+    print(f"\n📋 Configuration complète du modèle W&B:")
+    for k, v in run.config.items():
+        print(f"   {k}: {v}")
+
+    # Direct instantiation of Generator with all advanced arguments
+    scalar_normalizer = None
+    # If scalars are used, prepare the normalizer
+    if run.config.get("use_scalar_decoder", False):
+        _, conds_normalizer, design_normalizer, scalar_normalizer = prepare_data_with_separate_normalization(
+            problem,
+            device,
+            use_separate_normalization=run.config.get("use_separate_normalization", False),
+            conditions_normalization_type=run.config.get("conditions_normalization_type", "StandardScaler"),
+            scalars_normalization_type=run.config.get("scalars_normalization_type", "MinMax"),
+            normalization_type=run.config.get("normalization_type", "MinMax"),
+            normalization_strategy=run.config.get("normalization_strategy", "common"),
+        )
 
     model = Generator(
         latent_dim=run.config["latent_dim"],
-        noise_dim=run.config.get("noise_dim", 10),  # Default to 10 if not in config
+        noise_dim=run.config.get("noise_dim", 10),
         n_conds=len(problem.conditions),
         design_shape=design_shape,
         design_normalizer=design_normalizer,
         conds_normalizer=conds_normalizer,
-        use_noise_z=run.config.get("use_noise_z", False),  # Add this parameter
-        use_cpw_generator=run.config.get("use_cpw_generator", False),  # Add this parameter
+        scalar_normalizer=scalar_normalizer,
+        use_noise_z=run.config.get("use_noise_z", False),
+        use_mlp_features=run.config.get("use_mlp_features", False),
+        use_scalar_decoder=run.config.get("use_scalar_decoder", False),
+        use_cpw_generator=run.config.get("use_cpw_generator", False),
+        use_cpw_interpolation=run.config.get("use_cpw_interpolation", False),
+        cpw_interpolation_type=run.config.get("cpw_interpolation_type", "linear"),
+        use_separate_normalization=run.config.get("use_separate_normalization", False),
+        use_coord_decoder=run.config.get("use_coord_decoder", False),
+        use_bezier_layer=run.config.get("use_bezier_layer", False),
+        m_features=run.config.get("m_features", 256),
+        feature_gen_layers=tuple(run.config.get("feature_gen_layers", [1024])),
+        scalar_features=run.config.get("scalar_features", 1),
+        scalar_layers=tuple(run.config.get("scalar_layers", [128, 128, 128, 128])),
+        n_control_points=run.config.get("n_control_points", 32),
+        cpw_dense_layers=tuple(run.config.get("cpw_dense_layers", [1024])),
+        cpw_deconv_channels=tuple(run.config.get("cpw_deconv_channels", [768, 384, 192, 96])),
+        n_data_points=run.config.get("n_data_points", 192),
+        bezier_eps=run.config.get("bezier_eps", 1e-7),
     ).to(device)
     model.load_state_dict(ckpt["generator"])
     model.eval()
@@ -202,7 +229,7 @@ if __name__ == "__main__":
 
     # Compute curvature statistics for generated designs
     def compute_curvature_stats(coords):
-        # coords: (N, 2) ou (2, N)
+        # coords: (N, 2) or (2, N)
         if coords.shape[0] == 2:
             x, y = coords[0], coords[1]
         else:
@@ -224,18 +251,18 @@ if __name__ == "__main__":
         mean_curvatures.append(mean_c)
         std_curvatures.append(std_c)
 
-    print("Moyenne absolue de la courbure (générés):", np.mean(mean_curvatures))
-    print("Ecart-type de la courbure (générés):", np.mean(std_curvatures))
+    print("Mean absolute curvature (generated):", np.mean(mean_curvatures))
+    print("Standard deviation of curvature (generated):", np.mean(std_curvatures))
 
     def compute_smoothness(xy: np.ndarray) -> np.ndarray:
         """
-        Calcule la "lissitude" comme la norme L2 du gradient le long de la courbe.
+        Computes "smoothness" as the L2 norm of the gradient along the curve.
 
         Args:
-            xy: array de forme (B, N, 2) où B = batch, N = points, 2 = (x, y)
+            xy: array of shape (B, N, 2) where B = batch, N = points, 2 = (x, y)
 
         Returns:
-            np.ndarray de forme (B,) avec un score de lissitude par échantillon
+            np.ndarray of shape (B,) with a smoothness score per sample
         """
         diffs = xy[:, 1:, :] - xy[:, :-1, :]         # (B, N-1, 2)
         squared_norms = np.sum(diffs**2, axis=-1)    # (B, N-1)
@@ -245,15 +272,15 @@ if __name__ == "__main__":
     # Compute smoothness for generated designs
     gen_designs_np_reshaped = gen_designs_np.reshape(len(gen_designs_np), -1, 2)
     smoothness_scores = compute_smoothness(gen_designs_np_reshaped)
-    print("Smoothness (moyenne sur tout les designs):", np.mean(smoothness_scores))
+    print("Smoothness (average over all designs):", np.mean(smoothness_scores))
 
     def compute_cp_regularity(control_points: np.ndarray) -> np.ndarray:
         """
-        Mesure la régularité des points de contrôle basée sur l'écart à la moyenne des distances entre points.
+        Measures control point regularity based on the variance of distances between points.
         Args:
-            control_points: array (B, N, 2) où N est le nombre de points de contrôle
+            control_points: array (B, N, 2) where N is the number of control points
         Returns:
-            np.ndarray (B,) avec le score de régularité (plus bas = plus régulier)
+            np.ndarray (B,) with the regularity score (lower = more regular)
         """
         diffs = control_points[:, 1:, :] - control_points[:, :-1, :]  # (B, N-1, 2)
         dists = np.linalg.norm(diffs, axis=-1)  # (B, N-1)
@@ -263,7 +290,7 @@ if __name__ == "__main__":
 
     # Compute CP regularity for generated designs
     cp_regularity_scores = compute_cp_regularity(gen_designs_np_reshaped)
-    print("CP Regularity (moyenne sur tous les designs):", np.mean(cp_regularity_scores))
+    print("CP Regularity (average over all designs):", np.mean(cp_regularity_scores))
     
 
     # Simple MMD and DPP calculations without complex processing
@@ -299,3 +326,5 @@ if __name__ == "__main__":
     metrics_df.to_csv(out_path, mode="a", header=write_header, index=False)
 
     print(f"Seed {seed} done; appended to {out_path}")
+
+
